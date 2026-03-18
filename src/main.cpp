@@ -27,7 +27,7 @@
 //   [W]         [E]
 //   (left)      (right)
 //
-#define IR_W_PIN   5   // bit0 = West (far left)       — Sensor 1, GPIO5
+#define IR_W_PIN   5   // bit0 = West (far left)        — Sensor 1, GPIO5
 #define IR_NW_PIN  6   // bit1 = Northwest              — Sensor 2, GPIO6
 #define IR_N_PIN   7   // bit2 = North (center front)   — Sensor 3, GPIO7
 #define IR_NE_PIN  15  // bit3 = Northeast              — Sensor 4, GPIO15
@@ -118,29 +118,29 @@ void RIGHT_2()
 // ============================================================
 
 // ROTATE LEFT (CCW):
-// Left side (A,C) go FORWARD, Right side (B,D) go BACKWARD
-//    ↑A-----B↓
-//     | CCW  |
-//    ↑C-----D↓
-void TURNLEFT()
-{
-  MOTORA_FORWARD(Motor_PWM);   // A (left front)  = forward
-  MOTORB_BACKOFF(Motor_PWM);   // B (right front)  = backward
-  MOTORC_FORWARD(Motor_PWM);   // C (left rear)   = forward
-  MOTORD_BACKOFF(Motor_PWM);   // D (right rear)   = backward
-}
-
-// ROTATE RIGHT (CW):
 // Left side (A,C) go BACKWARD, Right side (B,D) go FORWARD
 //    ↓A-----B↑
-//     |  CW  |
+//     | CCW  |
 //    ↓C-----D↑
-void TURNRIGHT()
+void TURNLEFT()
 {
   MOTORA_BACKOFF(Motor_PWM);   // A (left front)  = backward
   MOTORB_FORWARD(Motor_PWM);   // B (right front)  = forward
   MOTORC_BACKOFF(Motor_PWM);   // C (left rear)   = backward
   MOTORD_FORWARD(Motor_PWM);   // D (right rear)   = forward
+}
+
+// ROTATE RIGHT (CW):
+// Left side (A,C) go FORWARD, Right side (B,D) go BACKWARD
+//    ↑A-----B↓
+//     |  CW  |
+//    ↑C-----D↓
+void TURNRIGHT()
+{
+  MOTORA_FORWARD(Motor_PWM);   // A (left front)  = forward
+  MOTORB_BACKOFF(Motor_PWM);   // B (right front)  = backward
+  MOTORC_FORWARD(Motor_PWM);   // C (left rear)   = forward
+  MOTORD_BACKOFF(Motor_PWM);   // D (right rear)   = backward
 }
 
 //    =A-----B=  
@@ -259,6 +259,22 @@ void turnright(int speed)
   if (Motor_PWM == 0) { STOP(); } else { TURNRIGHT(); }
 }
 
+// Differential steering — used by auto mode for smooth curves
+// Each side can have independent speed; negative = reverse
+void curve(int leftSpeed, int rightSpeed)
+{
+  int lp = speedToPwm(abs(leftSpeed));
+  int rp = speedToPwm(abs(rightSpeed));
+
+  if (leftSpeed > 0)       { MOTORA_FORWARD(lp); MOTORC_FORWARD(lp); }
+  else if (leftSpeed < 0)  { MOTORA_BACKOFF(lp);  MOTORC_BACKOFF(lp);  }
+  else                      { MOTORA_STOP(0);      MOTORC_STOP(0);      }
+
+  if (rightSpeed > 0)       { MOTORB_FORWARD(rp); MOTORD_FORWARD(rp); }
+  else if (rightSpeed < 0)  { MOTORB_BACKOFF(rp);  MOTORD_BACKOFF(rp);  }
+  else                      { MOTORB_STOP(0);      MOTORD_STOP(0);      }
+}
+
 // ============================================================
 // IR sensor reading
 // ============================================================
@@ -301,6 +317,13 @@ void handleCommand(const String& commandName, const String& paramsStr)
     turnleft(speed);                 // TANK ROTATE (Q key) — both sides opposite
   } else if (commandName == "mv_turnright") {
     turnright(speed);                // TANK ROTATE (E key) — both sides opposite
+  } else if (commandName == "mv_curve") {
+    int ci = paramsStr.indexOf(',');
+    if (ci != -1) {
+      int ls = paramsStr.substring(0, ci).toInt();
+      int rs = paramsStr.substring(ci + 1).toInt();
+      curve(ls, rs);
+    }
   } else if (commandName == "stop") {
     STOP();
   } else {

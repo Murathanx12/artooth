@@ -3,37 +3,69 @@ import serial
 import threading
 import signal
 import sys
-from dataclasses import dataclass
 import pygame
 
-# ---------------------------------------------------------------------------
-# Globals
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TUNABLE PARAMETERS — adjust these to change robot behaviour
+# ===========================================================================
+
+# -- Speed limits (1-100 scale sent to ESP32) --
+MIN_SPEED       = 5       # lowest usable motor speed
+MAX_SPEED       = 100     # highest motor speed
+DEFAULT_SPEED   = 50      # starting cruise speed (keys 1/2 adjust at runtime)
+
+# -- Differential steering ratios (how much the slow side slows down) --
+GENTLE_RATIO    = 0.4     # gentle correction: slow side = speed * this
+HARD_RATIO      = 0.15    # hard correction:   slow side = speed * this
+CURVE_RATIO     = 0.1     # 3-sensor curve:    slow side = speed * this
+
+# -- Adaptive speed multipliers (fraction of cruise speed for each situation) --
+GENTLE_SPEED_MULT = 0.6   # cruise * this during gentle corrections
+HARD_SPEED_MULT   = 0.4   # cruise * this during hard corrections
+CURVE_SPEED_MULT  = 0.3   # cruise * this during 3-sensor curves
+UNKNOWN_SPEED_MULT = 0.35 # cruise * this for unknown patterns
+RAMP_UP_STEP      = 1     # how fast speed ramps up on straights (+N per tick)
+
+# -- Recovery behaviour --
+RECOVERY_FWD_TIME   = 0.1   # seconds to creep forward when line is lost
+RECOVERY_BACK_TIME  = 0.5   # seconds to reverse if still lost
+RECOVERY_SPEED      = 15    # speed during recovery creep/reverse
+
+# -- End condition (all 5 sensors = finish line) --
+END_COAST_TIME  = 0.5     # seconds to coast forward after all sensors trigger
+END_COAST_SPEED = 20      # speed during end coast
+
+# -- UART --
+SERIAL_PORT     = '/dev/ttyAMA2'
+BAUD_RATE       = 115200
+PING_INTERVAL   = 5       # seconds between heartbeat pings
+
+# ===========================================================================
+# Globals (not tunable)
+# ===========================================================================
 running   = True
 auto_mode = False
 
 ir_status = 0
 ir_lock   = threading.Lock()
 
-PING_INTERVAL = 5  # seconds
+current_speed = DEFAULT_SPEED
 
-# ---------------------------------------------------------------------------
-# Speed config
-# ---------------------------------------------------------------------------
-@dataclass
-class SetConfig:
-    min_speed:     int   = 5
-    max_speed:     int   = 100
-    default_speed: int   = 50
-    gentle_factor: float = 0.6
+# Auto state machine
+STATE_FOLLOWING     = 0
+STATE_ENDING        = 1
+STATE_RECOVERY_FWD  = 2
+STATE_RECOVERY_BACK = 3
+STATE_STOPPED       = 4
 
-setConfig     = SetConfig()
-current_speed = setConfig.default_speed
+auto_state     = STATE_FOLLOWING
+state_start    = 0.0
+adaptive_speed = DEFAULT_SPEED
 
 # ---------------------------------------------------------------------------
 # UART
 # ---------------------------------------------------------------------------
-ser = serial.Serial('/dev/ttyAMA2', 115200, timeout=1)
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
 def sendSerialCommand(command_name, params):
     param_str   = ",".join(map(str, params))
@@ -69,6 +101,9 @@ def moveTurnRight(speed):
 def stopAll():
     sendSerialCommand('stop', [0])
 
+def moveCurve(left_speed, right_speed):
+    sendSerialCommand('mv_curve', [left_speed, right_speed])
+
 # ---------------------------------------------------------------------------
 # IR sensor helpers  (5-sensor arc on front semicircle)
 #   Sensor output: 1 = black line detected, 0 = white / no line
@@ -97,96 +132,162 @@ def get_ir_bits():
     return [(v >> i) & 1 for i in range(5)]
 
 # ---------------------------------------------------------------------------
-# FSM pattern sets (5 sensors: bit4=E, bit3=NE, bit2=N, bit1=NW, bit0=W)
+# FSM pattern sets (5 sensors — pattern bits: E(b4) NE(b3) N(b2) NW(b1) W(b0))
 # 1 = sees black line, 0 = sees white / no line
-#
-# Pattern bits:  E  NE  N  NW  W
-#               b4  b3 b2  b1 b0
 # ---------------------------------------------------------------------------
-#                          E NE  N NW  W
 STRAIGHT_PATTERNS = {
     0b00100,  # N only — perfectly centred
     0b01110,  # NE+N+NW — wide line, centred
     0b01010,  # NE+NW — symmetric, centred
-    0b11111,  # all sensors — intersection / wide marker
 }
 
 GENTLE_LEFT_PATTERNS = {
-    0b00110,  # N+NW — drifted slightly right → correct left
-    0b00010,  # NW only — drifted right
+    0b00110,  # N+NW — line drifting left
+    0b00010,  # NW only
 }
 
 HARD_LEFT_PATTERNS = {
-    0b00001,  # W only — drifted far right → hard left
-    0b00011,  # NW+W — drifted far right
+    0b00001,  # W only — line far left
+    0b00011,  # NW+W
+}
+
+CURVE_LEFT_PATTERNS = {
+    0b00111,  # W+NW+N — sharp left curve (3 sensors)
 }
 
 GENTLE_RIGHT_PATTERNS = {
-    0b01100,  # NE+N — drifted slightly left → correct right
-    0b01000,  # NE only — drifted left
+    0b01100,  # NE+N — line drifting right
+    0b01000,  # NE only
 }
 
 HARD_RIGHT_PATTERNS = {
-    0b10000,  # E only — drifted far left → hard right
-    0b11000,  # NE+E — drifted far left
+    0b10000,  # E only — line far right
+    0b11000,  # NE+E
 }
 
-STOP_PATTERNS = {
-    0b00000,  # no sensor sees line → lost
+CURVE_RIGHT_PATTERNS = {
+    0b11100,  # N+NE+E — sharp right curve (3 sensors)
+}
+
+END_PATTERN = 0b11111  # all 5 sensors = finish line
+
+STATE_NAMES = {
+    STATE_FOLLOWING:     "FOLLOW",
+    STATE_ENDING:        "ENDING",
+    STATE_RECOVERY_FWD:  "RECOV_F",
+    STATE_RECOVERY_BACK: "RECOV_B",
+    STATE_STOPPED:       "STOPPED",
 }
 
 # ---------------------------------------------------------------------------
-# Line following FSM
-# ALL corrections use moveTurnLeft / moveTurnRight (tank rotation)
-# NEVER uses moveLeft / moveRight (those are mecanum strafe)
+# Line following FSM — smooth differential steering, adaptive speed
+# Uses moveCurve(left, right) instead of tank rotations for stability
 # ---------------------------------------------------------------------------
 def line_follow_step():
+    global auto_state, state_start, adaptive_speed
+
     bits = get_ir_bits()
-    w  = bits[IDX_W]    # GPIO5
-    nw = bits[IDX_NW]   # GPIO6
-    n  = bits[IDX_N]    # GPIO7
-    ne = bits[IDX_NE]   # GPIO15
-    e  = bits[IDX_E]    # GPIO45
+    w  = bits[IDX_W]    # GPIO5  (Sensor 1)
+    nw = bits[IDX_NW]   # GPIO6  (Sensor 2)
+    n  = bits[IDX_N]    # GPIO7  (Sensor 3)
+    ne = bits[IDX_NE]   # GPIO15 (Sensor 4)
+    e  = bits[IDX_E]    # GPIO45 (Sensor 5)
 
     pattern = (e << 4) | (ne << 3) | (n << 2) | (nw << 1) | w
+    now = time.monotonic()
 
-    speed = max(setConfig.min_speed,
-                min(setConfig.max_speed, current_speed))
+    cruise = max(MIN_SPEED, min(MAX_SPEED, current_speed))
 
-    gentle_speed = max(setConfig.min_speed,
-                       int(speed * setConfig.gentle_factor))
+    # ---- STATE: ENDING (all sensors triggered → coast forward then stop) ----
+    if auto_state == STATE_ENDING:
+        if now - state_start >= END_COAST_TIME:
+            stopAll()
+            auto_state = STATE_STOPPED
+        return
 
-    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pattern={pattern:05b} | spd={speed}")
+    # ---- STATE: STOPPED ----
+    if auto_state == STATE_STOPPED:
+        return
 
-    # ---- FSM ----
+    # ---- STATE: RECOVERY FORWARD (lost line → creep forward) ----
+    if auto_state == STATE_RECOVERY_FWD:
+        if pattern != 0b00000:
+            auto_state = STATE_FOLLOWING
+            return
+        if now - state_start >= RECOVERY_FWD_TIME:
+            auto_state = STATE_RECOVERY_BACK
+            state_start = now
+            moveCurve(-RECOVERY_SPEED, -RECOVERY_SPEED)
+        return
 
+    # ---- STATE: RECOVERY BACK (still lost → back up) ----
+    if auto_state == STATE_RECOVERY_BACK:
+        if pattern != 0b00000:
+            auto_state = STATE_FOLLOWING
+            return
+        if now - state_start >= RECOVERY_BACK_TIME:
+            stopAll()
+            auto_state = STATE_FOLLOWING
+        return
+
+    # ---- STATE: FOLLOWING ----
+
+    # End condition — all 5 sensors
+    if pattern == END_PATTERN:
+        auto_state = STATE_ENDING
+        state_start = now
+        moveCurve(END_COAST_SPEED, END_COAST_SPEED)
+        print(">>> END LINE DETECTED — coasting")
+        return
+
+    # Lost line — no sensors
+    if pattern == 0b00000:
+        auto_state = STATE_RECOVERY_FWD
+        state_start = now
+        moveCurve(RECOVERY_SPEED, RECOVERY_SPEED)
+        print(">>> LINE LOST — creeping forward")
+        return
+
+    # Adaptive speed: ramp up on straights, slow on corrections
+    spd = adaptive_speed
     if pattern in STRAIGHT_PATTERNS:
-        moveForward(speed)
+        spd = min(cruise, adaptive_speed + RAMP_UP_STEP)
+    elif pattern in GENTLE_LEFT_PATTERNS or pattern in GENTLE_RIGHT_PATTERNS:
+        spd = max(MIN_SPEED, int(cruise * GENTLE_SPEED_MULT))
+    elif pattern in HARD_LEFT_PATTERNS or pattern in HARD_RIGHT_PATTERNS:
+        spd = max(MIN_SPEED, int(cruise * HARD_SPEED_MULT))
+    elif pattern in CURVE_LEFT_PATTERNS or pattern in CURVE_RIGHT_PATTERNS:
+        spd = max(MIN_SPEED, int(cruise * CURVE_SPEED_MULT))
+    else:
+        spd = max(MIN_SPEED, int(cruise * UNKNOWN_SPEED_MULT))
+    adaptive_speed = spd
+
+    # Differential steering (forward + turn blended for tray stability)
+    if pattern in STRAIGHT_PATTERNS:
+        moveCurve(spd, spd)
 
     elif pattern in GENTLE_LEFT_PATTERNS:
-        # Drifted right → turn left to correct
-        moveTurnLeft(gentle_speed)
+        moveCurve(int(spd * GENTLE_RATIO), spd)
 
     elif pattern in HARD_LEFT_PATTERNS:
-        # Drifted far right → hard left
-        moveTurnLeft(speed)
+        moveCurve(int(spd * HARD_RATIO), spd)
+
+    elif pattern in CURVE_LEFT_PATTERNS:
+        moveCurve(int(spd * CURVE_RATIO), spd)
 
     elif pattern in GENTLE_RIGHT_PATTERNS:
-        # Drifted left → turn right to correct
-        moveTurnRight(gentle_speed)
+        moveCurve(spd, int(spd * GENTLE_RATIO))
 
     elif pattern in HARD_RIGHT_PATTERNS:
-        # Drifted far left → hard right
-        moveTurnRight(speed)
+        moveCurve(spd, int(spd * HARD_RATIO))
 
-    elif pattern in STOP_PATTERNS:
-        stopAll()
+    elif pattern in CURVE_RIGHT_PATTERNS:
+        moveCurve(spd, int(spd * CURVE_RATIO))
 
     else:
-        # Unknown pattern → stop for safety
-        stopAll()
+        moveCurve(int(spd * 0.5), int(spd * 0.5))
 
-    # ---- FSM END ----
+    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pat={pattern:05b} | spd={spd} | {STATE_NAMES[auto_state]}")
 
 # ---------------------------------------------------------------------------
 # UART receive + ping thread
@@ -247,7 +348,7 @@ if __name__ == "__main__":
     def update_movement():
         if auto_mode:
             return
-        speed = max(setConfig.min_speed, min(setConfig.max_speed, current_speed))
+        speed = max(MIN_SPEED, min(MAX_SPEED, current_speed))
         if   pressed['w']: moveForward(speed)
         elif pressed['s']: moveReverse(speed)
         elif pressed['q']: moveTurnLeft(speed)     # Q = tank rotate left
@@ -267,9 +368,11 @@ if __name__ == "__main__":
         pat  = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
 
         screen.blit(font.render(f"MODE: {mode_label}",                         True, mode_color),    (20, 20))
-        screen.blit(font.render(f"Speed: {current_speed}",                     True, (200,200,200)), (20, 60))
+        screen.blit(font.render(f"Speed: {current_speed}  Adapt: {adaptive_speed}",  True, (200,200,200)), (20, 60))
         screen.blit(font.render(f"W={bits[IDX_W]} NW={bits[IDX_NW]} N={bits[IDX_N]} NE={bits[IDX_NE]} E={bits[IDX_E]}", True, (100,180,255)), (20, 100))
         screen.blit(font.render(f"Pattern: {pat:05b}  ({pat})",                True, (100,180,255)), (20, 135))
+        state_label = STATE_NAMES.get(auto_state, "?") if auto_mode else "-"
+        screen.blit(font.render(f"State: {state_label}",                       True, (180,220,180)), (20, 170))
         screen.blit(font.render("M=auto  1/2=speed  Esc=quit",                 True, (120,120,120)), (20, 240))
         pygame.display.flip()
 
@@ -283,6 +386,9 @@ if __name__ == "__main__":
                     auto_mode = not auto_mode
                     pressed   = {k: False for k in pressed}
                     stopAll()
+                    if auto_mode:
+                        auto_state = STATE_FOLLOWING
+                        adaptive_speed = current_speed
                     print("AUTO ON" if auto_mode else "MANUAL")
 
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
@@ -295,10 +401,10 @@ if __name__ == "__main__":
                 elif event.key == pygame.K_ESCAPE: running = False
 
                 elif event.key == pygame.K_1:
-                    current_speed = max(setConfig.min_speed, current_speed - 5)
+                    current_speed = max(MIN_SPEED, current_speed - 5)
                     print(f"Speed -> {current_speed}");  update_movement()
                 elif event.key == pygame.K_2:
-                    current_speed = min(setConfig.max_speed, current_speed + 5)
+                    current_speed = min(MAX_SPEED, current_speed + 5)
                     print(f"Speed -> {current_speed}");  update_movement()
 
             elif event.type == pygame.KEYUP:
