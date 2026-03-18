@@ -70,30 +70,70 @@ def stopAll():
     sendSerialCommand('stop', [0])
 
 # ---------------------------------------------------------------------------
-# IR sensor helpers
+# IR sensor helpers  (5-sensor arc on front semicircle)
 #   Sensor output: 1 = black line detected, 0 = white / no line
 #
-#   bit0 = GPIO5  = RIGHT sensor
-#   bit1 = GPIO6  = MIDDLE sensor
-#   bit2 = GPIO7  = LEFT sensor
+#         [N]  North (center front)
+#        /   \
+#     [NW]   [NE]
+#     /         \
+#   [W]         [E]
+#
+#   bit0 = GPIO5  = W   (West / far left)
+#   bit1 = GPIO6  = NW  (Northwest)
+#   bit2 = GPIO7  = N   (North / center front)
+#   bit3 = GPIO15 = NE  (Northeast)
+#   bit4 = GPIO45 = E   (East / far right)
 # ---------------------------------------------------------------------------
+IDX_W  = 0
+IDX_NW = 1
+IDX_N  = 2
+IDX_NE = 3
+IDX_E  = 4
+
 def get_ir_bits():
     with ir_lock:
         v = ir_status
-    # Sensor output: 1 = black line detected, 0 = white / no line
-    # No inversion needed
-    return [(v >> i) & 1 for i in range(7)]
+    return [(v >> i) & 1 for i in range(5)]
 
 # ---------------------------------------------------------------------------
-# FSM pattern sets
+# FSM pattern sets (5 sensors: bit4=E, bit3=NE, bit2=N, bit1=NW, bit0=W)
 # 1 = sees black line, 0 = sees white / no line
+#
+# Pattern bits:  E  NE  N  NW  W
+#               b4  b3 b2  b1 b0
 # ---------------------------------------------------------------------------
-STRAIGHT_PATTERNS     = {0b010, 0b101, 0b111}
-GENTLE_RIGHT_PATTERNS = {0b011}   # mid+right see line → drifted left
-HARD_RIGHT_PATTERNS   = {0b001}   # only right sees line → drifted far left
-GENTLE_LEFT_PATTERNS  = {0b110}   # mid+left see line → drifted right
-HARD_LEFT_PATTERNS    = {0b100}   # only left sees line → drifted far right
-STOP_PATTERNS         = {0b000}   # no sensor sees line → lost
+#                          E NE  N NW  W
+STRAIGHT_PATTERNS = {
+    0b00100,  # N only — perfectly centred
+    0b01110,  # NE+N+NW — wide line, centred
+    0b01010,  # NE+NW — symmetric, centred
+    0b11111,  # all sensors — intersection / wide marker
+}
+
+GENTLE_LEFT_PATTERNS = {
+    0b00110,  # N+NW — drifted slightly right → correct left
+    0b00010,  # NW only — drifted right
+}
+
+HARD_LEFT_PATTERNS = {
+    0b00001,  # W only — drifted far right → hard left
+    0b00011,  # NW+W — drifted far right
+}
+
+GENTLE_RIGHT_PATTERNS = {
+    0b01100,  # NE+N — drifted slightly left → correct right
+    0b01000,  # NE only — drifted left
+}
+
+HARD_RIGHT_PATTERNS = {
+    0b10000,  # E only — drifted far left → hard right
+    0b11000,  # NE+E — drifted far left
+}
+
+STOP_PATTERNS = {
+    0b00000,  # no sensor sees line → lost
+}
 
 # ---------------------------------------------------------------------------
 # Line following FSM
@@ -101,12 +141,14 @@ STOP_PATTERNS         = {0b000}   # no sensor sees line → lost
 # NEVER uses moveLeft / moveRight (those are mecanum strafe)
 # ---------------------------------------------------------------------------
 def line_follow_step():
-    bits  = get_ir_bits()
-    right = bits[0]   # GPIO5
-    mid   = bits[1]   # GPIO6
-    left  = bits[2]   # GPIO7
+    bits = get_ir_bits()
+    w  = bits[IDX_W]    # GPIO5
+    nw = bits[IDX_NW]   # GPIO6
+    n  = bits[IDX_N]    # GPIO7
+    ne = bits[IDX_NE]   # GPIO15
+    e  = bits[IDX_E]    # GPIO45
 
-    pattern = (left << 2) | (mid << 1) | right
+    pattern = (e << 4) | (ne << 3) | (n << 2) | (nw << 1) | w
 
     speed = max(setConfig.min_speed,
                 min(setConfig.max_speed, current_speed))
@@ -114,39 +156,34 @@ def line_follow_step():
     gentle_speed = max(setConfig.min_speed,
                        int(speed * setConfig.gentle_factor))
 
-    print(f"IR L={left} M={mid} R={right} | pattern={pattern:03b} | spd={speed}")
+    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pattern={pattern:05b} | spd={speed}")
 
     # ---- FSM ----
 
     if pattern in STRAIGHT_PATTERNS:
-        # Line centred → go forward
         moveForward(speed)
 
-    elif pattern in GENTLE_RIGHT_PATTERNS:
-        # Mid + right see line → drifted slightly left
-        # Tank rotate CW (left) at gentle speed
+    elif pattern in GENTLE_LEFT_PATTERNS:
+        # Drifted right → turn left to correct
         moveTurnLeft(gentle_speed)
 
-    elif pattern in HARD_RIGHT_PATTERNS:
-        # Only right sees line → drifted far left
-        # Tank rotate CW (left) at full speed
+    elif pattern in HARD_LEFT_PATTERNS:
+        # Drifted far right → hard left
         moveTurnLeft(speed)
 
-    elif pattern in GENTLE_LEFT_PATTERNS:
-        # Mid + left see line → drifted slightly right
-        # Tank rotate CCW (right) at gentle speed
+    elif pattern in GENTLE_RIGHT_PATTERNS:
+        # Drifted left → turn right to correct
         moveTurnRight(gentle_speed)
 
-    elif pattern in HARD_LEFT_PATTERNS:
-        # Only left sees line → drifted far right
-        # Tank rotate CCW (right) at full speed
+    elif pattern in HARD_RIGHT_PATTERNS:
+        # Drifted far left → hard right
         moveTurnRight(speed)
 
     elif pattern in STOP_PATTERNS:
-        # No sensor sees line → lost → stop
         stopAll()
 
     else:
+        # Unknown pattern → stop for safety
         stopAll()
 
     # ---- FSM END ----
@@ -164,10 +201,10 @@ def uart_thread():
             if text.startswith("IR_STATUS:"):
                 try:
                     _, value_str = text.split(":", 1)
-                    value = int(value_str) & 0x7F
+                    value = int(value_str) & 0x1F
                     with ir_lock:
                         ir_status = value
-                    print(f"IR raw={value:07b}")
+                    print(f"IR raw={value:05b}")
                 except ValueError:
                     print(f"Bad IR_STATUS: {text}")
             else:
@@ -227,12 +264,12 @@ if __name__ == "__main__":
         mode_color = (0, 220, 100) if auto_mode else (220, 180, 0)
         mode_label = "AUTO  (line following)" if auto_mode else "MANUAL  (WASD+QE)"
         bits = get_ir_bits()
-        pat  = (bits[2] << 2) | (bits[1] << 1) | bits[0]
+        pat  = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
 
         screen.blit(font.render(f"MODE: {mode_label}",                         True, mode_color),    (20, 20))
         screen.blit(font.render(f"Speed: {current_speed}",                     True, (200,200,200)), (20, 60))
-        screen.blit(font.render(f"IR   L={bits[2]}  M={bits[1]}  R={bits[0]}", True, (100,180,255)), (20, 100))
-        screen.blit(font.render(f"Pattern: {pat:03b}  ({pat})",                True, (100,180,255)), (20, 135))
+        screen.blit(font.render(f"W={bits[IDX_W]} NW={bits[IDX_NW]} N={bits[IDX_N]} NE={bits[IDX_NE]} E={bits[IDX_E]}", True, (100,180,255)), (20, 100))
+        screen.blit(font.render(f"Pattern: {pat:05b}  ({pat})",                True, (100,180,255)), (20, 135))
         screen.blit(font.render("M=auto  1/2=speed  Esc=quit",                 True, (120,120,120)), (20, 240))
         pygame.display.flip()
 

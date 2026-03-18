@@ -18,17 +18,22 @@
 #define RXD2 16  // GPIO16 as RX
 #define TXD2 17  // GPIO17 as TX
 
-// ---------------- IR Sensor pins (minilab 5) ----------------
-#define IR_PIN_0  5   // bit0 = right sensor
-#define IR_PIN_1  6   // bit1 = middle sensor
-#define IR_PIN_2  7   // bit2 = left sensor
-#define IR_PIN_3  15  // bit3 (unused for now)
-#define IR_PIN_4  38  // bit4 (unused)
-#define IR_PIN_5  39  // bit5 (unused)
-#define IR_PIN_6  40  // bit6 (unused)
+// ---------------- IR Sensor pins (5-sensor arc on front semicircle) --------
+// Sensors arranged on a semicircle from the front wheel shaft:
+//         [N]  North (center front)
+//        /   \
+//     [NW]   [NE]
+//     /         \
+//   [W]         [E]
+//   (left)      (right)
+//
+#define IR_W_PIN   5   // bit0 = West (far left)       — Sensor 1, GPIO5
+#define IR_NW_PIN  6   // bit1 = Northwest              — Sensor 2, GPIO6
+#define IR_N_PIN   7   // bit2 = North (center front)   — Sensor 3, GPIO7
+#define IR_NE_PIN  15  // bit3 = Northeast              — Sensor 4, GPIO15
+#define IR_E_PIN   45  // bit4 = East (far right)       — Sensor 5, GPIO45
 
-const int irPins[7] = {IR_PIN_0, IR_PIN_1, IR_PIN_2,
-                       IR_PIN_3, IR_PIN_4, IR_PIN_5, IR_PIN_6};
+const int irPins[5] = {IR_W_PIN, IR_NW_PIN, IR_N_PIN, IR_NE_PIN, IR_E_PIN};
 
 // ---------------- Motor control macros (ORIGINAL — DO NOT CHANGE) ---------
 // A = Left front
@@ -260,7 +265,7 @@ void turnright(int speed)
 uint8_t readIrStatus()
 {
   uint8_t val = 0;
-  for (int i = 0; i < 7; i++) {
+  for (int i = 0; i < 5; i++) {
     if (digitalRead(irPins[i])) {
       val |= (1 << i);
     }
@@ -313,8 +318,8 @@ void setup()
   uart2.begin(115200, SERIAL_8N1, RXD2, TXD2);
   uart2.setTimeout(10);
 
-  // IR sensor pins
-  for (int i = 0; i < 7; i++) {
+  // IR sensor pins (5 sensors on front arc)
+  for (int i = 0; i < 5; i++) {
     pinMode(irPins[i], INPUT);
   }
 

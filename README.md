@@ -12,7 +12,7 @@ A mecanum-wheeled robot with IR-based line following. The ESP32-S3 handles motor
 - **MCU:** ESP32-S3-DevKitM-1
 - **SBC:** Raspberry Pi (connected via UART at 115200 baud)
 - **Motors:** 4x mecanum wheels (A/B = front left/right, C/D = rear left/right)
-- **Sensors:** 7-channel IR array (3 used for line following: left, middle, right)
+- **Sensors:** 5 IR sensors on a front semicircle arc (W, NW, N, NE, E) using GPIO 5, 6, 7, 15, 45
 
 ## Setup
 
