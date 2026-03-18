@@ -9,25 +9,34 @@ import pygame
 # TUNABLE PARAMETERS — adjust these to change robot behaviour
 # ===========================================================================
 
+# -- Sensor --
+REVERSE_SENSOR_ORDER = True   # True = flip bit order (bit0↔bit4, bit1↔bit3)
+
 # -- Speed limits (1-100 scale sent to ESP32) --
 MIN_SPEED       = 5       # lowest usable motor speed
 MAX_SPEED       = 100     # highest motor speed
 DEFAULT_SPEED   = 50      # starting cruise speed (keys 1/2 adjust at runtime)
 
-# -- Differential steering ratios (how much the slow side slows down) --
-GENTLE_RATIO    = 0.4     # gentle correction: slow side = speed * this
-HARD_RATIO      = 0.15    # hard correction:   slow side = speed * this
-CURVE_RATIO     = 0.1     # 3-sensor curve:    slow side = speed * this
+# -- Steering: [fast_side, slow_side] for each correction level --
+#    Positive = forward, 0 = stop, negative = reverse
+#    These are actual speed values (not ratios). The fast side gets this speed,
+#    the slow side gets the other. Left/right is mirrored automatically.
+STRAIGHT_SPEED    = 45    # both sides equal on a straight line
+GENTLE_FAST       = 35    # fast side speed during gentle correction
+GENTLE_SLOW       = 12    # slow side speed during gentle correction
+HARD_FAST         = 28    # fast side speed during hard correction
+HARD_SLOW         = -5    # slow side (negative = reverse for tighter turn)
+CURVE_FAST        = 25    # fast side speed during sharp 3-sensor curve
+CURVE_SLOW        = -12   # slow side reversed hard for sharp curves
+UNKNOWN_FAST      = 15    # both sides for unknown patterns
+UNKNOWN_SLOW      = 15
 
-# -- Adaptive speed multipliers (fraction of cruise speed for each situation) --
-GENTLE_SPEED_MULT = 0.6   # cruise * this during gentle corrections
-HARD_SPEED_MULT   = 0.4   # cruise * this during hard corrections
-CURVE_SPEED_MULT  = 0.3   # cruise * this during 3-sensor curves
-UNKNOWN_SPEED_MULT = 0.35 # cruise * this for unknown patterns
-RAMP_UP_STEP      = 1     # how fast speed ramps up on straights (+N per tick)
+# -- Adaptive speed (how fast the robot ramps up on straights) --
+RAMP_UP_STEP      = 1     # speed increases by this each tick on straights
 
 # -- Recovery behaviour --
-RECOVERY_FWD_TIME   = 0.1   # seconds to creep forward when line is lost
+LOST_LINE_TIMEOUT   = 0.5   # seconds of no reading before recovery starts
+RECOVERY_FWD_TIME   = 0.1   # seconds to creep forward during recovery
 RECOVERY_BACK_TIME  = 0.5   # seconds to reverse if still lost
 RECOVERY_SPEED      = 15    # speed during recovery creep/reverse
 
@@ -61,6 +70,7 @@ STATE_STOPPED       = 4
 auto_state     = STATE_FOLLOWING
 state_start    = 0.0
 adaptive_speed = DEFAULT_SPEED
+lost_since     = 0.0          # when we first saw no sensors (0 = not lost)
 
 # ---------------------------------------------------------------------------
 # UART
@@ -129,6 +139,8 @@ IDX_E  = 4
 def get_ir_bits():
     with ir_lock:
         v = ir_status
+    if REVERSE_SENSOR_ORDER:
+        return [(v >> (4 - i)) & 1 for i in range(5)]
     return [(v >> i) & 1 for i in range(5)]
 
 # ---------------------------------------------------------------------------
@@ -184,21 +196,21 @@ STATE_NAMES = {
 # Uses moveCurve(left, right) instead of tank rotations for stability
 # ---------------------------------------------------------------------------
 def line_follow_step():
-    global auto_state, state_start, adaptive_speed
+    global auto_state, state_start, adaptive_speed, lost_since
 
     bits = get_ir_bits()
-    w  = bits[IDX_W]    # GPIO5  (Sensor 1)
-    nw = bits[IDX_NW]   # GPIO6  (Sensor 2)
-    n  = bits[IDX_N]    # GPIO7  (Sensor 3)
-    ne = bits[IDX_NE]   # GPIO15 (Sensor 4)
-    e  = bits[IDX_E]    # GPIO45 (Sensor 5)
+    w  = bits[IDX_W]
+    nw = bits[IDX_NW]
+    n  = bits[IDX_N]
+    ne = bits[IDX_NE]
+    e  = bits[IDX_E]
 
     pattern = (e << 4) | (ne << 3) | (n << 2) | (nw << 1) | w
     now = time.monotonic()
 
     cruise = max(MIN_SPEED, min(MAX_SPEED, current_speed))
 
-    # ---- STATE: ENDING (all sensors triggered → coast forward then stop) ----
+    # ---- STATE: ENDING ----
     if auto_state == STATE_ENDING:
         if now - state_start >= END_COAST_TIME:
             stopAll()
@@ -209,10 +221,11 @@ def line_follow_step():
     if auto_state == STATE_STOPPED:
         return
 
-    # ---- STATE: RECOVERY FORWARD (lost line → creep forward) ----
+    # ---- STATE: RECOVERY FORWARD ----
     if auto_state == STATE_RECOVERY_FWD:
         if pattern != 0b00000:
             auto_state = STATE_FOLLOWING
+            lost_since = 0.0
             return
         if now - state_start >= RECOVERY_FWD_TIME:
             auto_state = STATE_RECOVERY_BACK
@@ -220,14 +233,16 @@ def line_follow_step():
             moveCurve(-RECOVERY_SPEED, -RECOVERY_SPEED)
         return
 
-    # ---- STATE: RECOVERY BACK (still lost → back up) ----
+    # ---- STATE: RECOVERY BACK ----
     if auto_state == STATE_RECOVERY_BACK:
         if pattern != 0b00000:
             auto_state = STATE_FOLLOWING
+            lost_since = 0.0
             return
         if now - state_start >= RECOVERY_BACK_TIME:
             stopAll()
             auto_state = STATE_FOLLOWING
+            lost_since = 0.0
         return
 
     # ---- STATE: FOLLOWING ----
@@ -236,58 +251,58 @@ def line_follow_step():
     if pattern == END_PATTERN:
         auto_state = STATE_ENDING
         state_start = now
+        lost_since = 0.0
         moveCurve(END_COAST_SPEED, END_COAST_SPEED)
-        print(">>> END LINE DETECTED — coasting")
+        print(">>> END LINE DETECTED")
         return
 
-    # Lost line — no sensors
+    # Lost line — debounced: must see nothing for LOST_LINE_TIMEOUT seconds
     if pattern == 0b00000:
-        auto_state = STATE_RECOVERY_FWD
-        state_start = now
-        moveCurve(RECOVERY_SPEED, RECOVERY_SPEED)
-        print(">>> LINE LOST — creeping forward")
+        if lost_since == 0.0:
+            lost_since = now
+        if now - lost_since >= LOST_LINE_TIMEOUT:
+            auto_state = STATE_RECOVERY_FWD
+            state_start = now
+            moveCurve(RECOVERY_SPEED, RECOVERY_SPEED)
+            print(">>> LINE LOST — recovery started")
         return
-
-    # Adaptive speed: ramp up on straights, slow on corrections
-    spd = adaptive_speed
-    if pattern in STRAIGHT_PATTERNS:
-        spd = min(cruise, adaptive_speed + RAMP_UP_STEP)
-    elif pattern in GENTLE_LEFT_PATTERNS or pattern in GENTLE_RIGHT_PATTERNS:
-        spd = max(MIN_SPEED, int(cruise * GENTLE_SPEED_MULT))
-    elif pattern in HARD_LEFT_PATTERNS or pattern in HARD_RIGHT_PATTERNS:
-        spd = max(MIN_SPEED, int(cruise * HARD_SPEED_MULT))
-    elif pattern in CURVE_LEFT_PATTERNS or pattern in CURVE_RIGHT_PATTERNS:
-        spd = max(MIN_SPEED, int(cruise * CURVE_SPEED_MULT))
     else:
-        spd = max(MIN_SPEED, int(cruise * UNKNOWN_SPEED_MULT))
-    adaptive_speed = spd
+        lost_since = 0.0
 
-    # Differential steering (forward + turn blended for tray stability)
+    # Adaptive speed: ramp on straights, use tunable values on corrections
     if pattern in STRAIGHT_PATTERNS:
-        moveCurve(spd, spd)
+        adaptive_speed = min(cruise, adaptive_speed + RAMP_UP_STEP)
+        moveCurve(adaptive_speed, adaptive_speed)
 
     elif pattern in GENTLE_LEFT_PATTERNS:
-        moveCurve(int(spd * GENTLE_RATIO), spd)
+        adaptive_speed = GENTLE_FAST
+        moveCurve(GENTLE_SLOW, GENTLE_FAST)
 
     elif pattern in HARD_LEFT_PATTERNS:
-        moveCurve(int(spd * HARD_RATIO), spd)
+        adaptive_speed = HARD_FAST
+        moveCurve(HARD_SLOW, HARD_FAST)
 
     elif pattern in CURVE_LEFT_PATTERNS:
-        moveCurve(int(spd * CURVE_RATIO), spd)
+        adaptive_speed = CURVE_FAST
+        moveCurve(CURVE_SLOW, CURVE_FAST)
 
     elif pattern in GENTLE_RIGHT_PATTERNS:
-        moveCurve(spd, int(spd * GENTLE_RATIO))
+        adaptive_speed = GENTLE_FAST
+        moveCurve(GENTLE_FAST, GENTLE_SLOW)
 
     elif pattern in HARD_RIGHT_PATTERNS:
-        moveCurve(spd, int(spd * HARD_RATIO))
+        adaptive_speed = HARD_FAST
+        moveCurve(HARD_FAST, HARD_SLOW)
 
     elif pattern in CURVE_RIGHT_PATTERNS:
-        moveCurve(spd, int(spd * CURVE_RATIO))
+        adaptive_speed = CURVE_FAST
+        moveCurve(CURVE_FAST, CURVE_SLOW)
 
     else:
-        moveCurve(int(spd * 0.5), int(spd * 0.5))
+        adaptive_speed = UNKNOWN_FAST
+        moveCurve(UNKNOWN_FAST, UNKNOWN_SLOW)
 
-    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pat={pattern:05b} | spd={spd} | {STATE_NAMES[auto_state]}")
+    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pat={pattern:05b} | spd={adaptive_speed} | {STATE_NAMES[auto_state]}")
 
 # ---------------------------------------------------------------------------
 # UART receive + ping thread
@@ -389,6 +404,7 @@ if __name__ == "__main__":
                     if auto_mode:
                         auto_state = STATE_FOLLOWING
                         adaptive_speed = current_speed
+                        lost_since = 0.0
                     print("AUTO ON" if auto_mode else "MANUAL")
 
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
