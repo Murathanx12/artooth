@@ -12,7 +12,6 @@ import pygame
 # -- Sensor Configuration --
 REVERSE_SENSOR_ORDER = False 
 LOST_DETECTION_DELAY = 0.5
-LOST_DETECTION_FRAMES = 0
 
 # -- Algorithm Weights (W, NW, N, NE, E) --
 TURN_STRENGTHS = [-7, -4.5, 0.0, 4.5, 7]
@@ -30,6 +29,20 @@ MAX_TURN_STRENGTH = 9.0
 # Add a rate limiter
 last_control_time = 0
 CONTROL_INTERVAL = 0.033  # 30 Hz instead of 60 Hz
+
+# -- PID Controller --
+KP = 18.0         # Proportional: main steering response
+KI = 0.5          # Integral: eliminates curve drift (keep small)
+KD = 12.0         # Derivative: dampens oscillation (critical for tray)
+PID_I_MAX = 50.0  # Anti-windup clamp
+
+# -- Strafe Correction (mecanum advantage) --
+STRAFE_WEIGHT_THRESHOLD = 3.0  # Below this |turn_var|, use mostly strafe
+STRAFE_BLEND_RANGE = 2.0       # Transition range to pure rotation
+STRAFE_GAIN = 8.0              # Strafe correction strength
+
+# -- Omega Rate Limiter (tray stability) --
+OMEGA_RATE_LIMIT = 5.0  # Max rotation change per tick
 
 # -- Recovery & Junction Parameters --
 RECOVERY_REVERSE_SPEED = 20
@@ -58,11 +71,41 @@ STATE_ENDPOINT     = 1
 STATE_LOST_REVERSE = 2
 STATE_LOST_PIVOT   = 3
 STATE_STOPPED      = 4
+STATE_PARKING      = 5
+STATE_LOST_STRAFE  = 6
 
 auto_state     = STATE_FOLLOWING
 internal_speed = 0.0 # Tracks the 0.0 to 5.0 algorithmic speed
 last_turn_var  = 0.0 # Memory for which way we were turning before getting lost
 turn_var = 0.0
+lost_start_time = None
+
+# PID state
+pid_integral   = 0.0
+pid_last_error = 0.0
+pid_last_time  = 0.0
+last_omega     = 0.0  # For omega rate limiting
+
+# Delivery zone parking
+all_on_start_time  = None
+parking_start_time = None
+DELIVERY_ZONE_TIME_THRESHOLD = 0.4  # Seconds of sustained all-5-ON = delivery zone
+PARKING_DRIVE_TIME = 0.8            # Seconds to drive forward into zone
+PARKING_SPEED = 15                  # Slow crawl into the zone
+
+# Strafe recovery
+strafe_search_start = None
+STRAFE_SEARCH_DURATION = 0.4  # Seconds to try strafing before falling back
+STRAFE_SEARCH_SPEED = 30      # Strafe speed during search
+STRAFE_SEARCH_FWD = 10        # Slight forward during strafe search
+
+# Debug values for GUI
+debug_pid_p = 0.0
+debug_pid_i = 0.0
+debug_pid_d = 0.0
+debug_vx = 0
+debug_vy = 0
+debug_omega = 0
 
 STATE_NAMES = {
     STATE_FOLLOWING:    "FOLLOW",
@@ -70,6 +113,8 @@ STATE_NAMES = {
     STATE_LOST_REVERSE: "LOST_REV",
     STATE_LOST_PIVOT:   "LOST_PIVOT",
     STATE_STOPPED:      "STOPPED",
+    STATE_PARKING:      "PARKING",
+    STATE_LOST_STRAFE:  "LOST_STRAFE",
 }
 
 # ---------------------------------------------------------------------------
@@ -90,6 +135,7 @@ def moveTurnLeft(speed): sendSerialCommand('mv_turnleft', [speed])
 def moveTurnRight(speed): sendSerialCommand('mv_turnright', [speed])
 def stopAll(): sendSerialCommand('stop', [0])
 def moveCurve(left_speed, right_speed): sendSerialCommand('mv_curve', [left_speed, right_speed])
+def moveVector(vx, vy, omega): sendSerialCommand('mv_vector', [int(vx), int(vy), int(omega)])
 
 # ---------------------------------------------------------------------------
 # IR Sensor Helpers
@@ -117,12 +163,77 @@ def get_ir_bits():
     return [(v >> i) & 1 for i in range(5)]
 
 # ---------------------------------------------------------------------------
+# PID, Strafe, Speed & Rate Limiting Functions
+# ---------------------------------------------------------------------------
+
+def reset_pid():
+    global pid_integral, pid_last_error, pid_last_time, last_omega
+    pid_integral = 0.0
+    pid_last_error = 0.0
+    pid_last_time = time.time()
+    last_omega = 0.0
+
+def pid_compute(error, dt):
+    global pid_integral, pid_last_error
+    global debug_pid_p, debug_pid_i, debug_pid_d
+    if dt <= 0:
+        return 0.0
+    P = KP * error
+    pid_integral += error * dt
+    pid_integral = max(-PID_I_MAX, min(PID_I_MAX, pid_integral))
+    I = KI * pid_integral
+    D = KD * (error - pid_last_error) / dt
+    pid_last_error = error
+    debug_pid_p, debug_pid_i, debug_pid_d = P, I, D
+    return P + I + D
+
+def compute_strafe_correction(turn_var):
+    abs_tv = abs(turn_var)
+    if abs_tv < STRAFE_WEIGHT_THRESHOLD:
+        strafe_factor = 1.0
+    elif abs_tv < STRAFE_WEIGHT_THRESHOLD + STRAFE_BLEND_RANGE:
+        strafe_factor = 1.0 - (abs_tv - STRAFE_WEIGHT_THRESHOLD) / STRAFE_BLEND_RANGE
+    else:
+        strafe_factor = 0.0
+    return turn_var * STRAFE_GAIN * strafe_factor
+
+def compute_target_speed(bits, turn_var):
+    active = sum(bits)
+    abs_turn = abs(turn_var)
+    if active == 0:
+        return 0.0
+    # Only center sensor -> perfectly straight -> MAX
+    if bits == [0, 0, 1, 0, 0]:
+        return 5.0
+    # Center + one neighbor -> gentle curve -> HIGH
+    if active <= 2 and bits[IDX_N] == 1:
+        return 4.5
+    # Outer sensor only -> sharp correction -> SLOW (check before medium)
+    if abs_turn >= 5.0:
+        return 2.0
+    # Diagonal sensors -> moderate curve -> MEDIUM
+    if abs_turn >= 3.0:
+        return 3.0
+    # Default: weighted average
+    return sum(b * m for b, m in zip(bits, MOVE_STRENGTHS)) / active
+
+def rate_limit_omega(new_omega):
+    global last_omega
+    delta = new_omega - last_omega
+    if abs(delta) > OMEGA_RATE_LIMIT:
+        new_omega = last_omega + OMEGA_RATE_LIMIT * (1 if delta > 0 else -1)
+    last_omega = new_omega
+    return new_omega
+
+# ---------------------------------------------------------------------------
 # ALGORITHMIC LINE FOLLOWING FSM
 # ---------------------------------------------------------------------------
 def line_follow_step():
     global auto_state, internal_speed, last_turn_var, current_speed, turn_var
-    global lost_frame_counter
+    global lost_start_time, all_on_start_time, parking_start_time, strafe_search_start
+    global pid_last_time, auto_mode
     global last_control_time
+    global debug_vx, debug_vy, debug_omega
 
     current_time = time.time()
     if current_time - last_control_time < CONTROL_INTERVAL:
@@ -131,143 +242,159 @@ def line_follow_step():
 
     bits = get_ir_bits()
     active_count = sum(bits)
-    pattern = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
-    
+
     # Speed multiplier (maps 0.0-5.0 scale to actual motor speed)
-    multiplier = current_speed / 5.0 
+    multiplier = current_speed / 5.0
 
     # 1. STATE: STOPPED / BRAKING
     if auto_state == STATE_STOPPED:
         if internal_speed > 0:
-            # Gently ramp down the speed to prevent spilling
-            internal_speed = max(0.0, internal_speed - DECEL*5)
-            left_motor  = int(round(internal_speed * multiplier))
-            right_motor = int(round(internal_speed * multiplier))
-            moveCurve(left_motor, right_motor)
+            internal_speed = max(0.0, internal_speed - DECEL * 5)
+            vx = int(round(internal_speed * multiplier))
+            moveVector(vx, 0, 0)
         else:
-            stopAll() # Only lock motors once speed has gracefully reached 0
+            stopAll()
         return
 
-    # 2. STATE: LOST - REVERSING TO FIND LINE
+    # 2. STATE: PARKING (delivery zone)
+    if auto_state == STATE_PARKING:
+        elapsed = current_time - parking_start_time
+        if elapsed < PARKING_DRIVE_TIME:
+            moveVector(PARKING_SPEED, 0, 0)
+        else:
+            stopAll()
+            auto_mode = False
+            print(">>> PARKED. ATTEMPT COMPLETE.")
+        return
+
+    # 3. STATE: LOST - STRAFE SEARCH (try strafing before reversing)
+    if auto_state == STATE_LOST_STRAFE:
+        if active_count > 0:
+            auto_state = STATE_FOLLOWING
+            reset_pid()
+            strafe_search_start = None
+            return
+        elapsed = current_time - strafe_search_start
+        if elapsed < STRAFE_SEARCH_DURATION:
+            strafe_dir = 1 if last_turn_var > 0 else -1
+            moveVector(STRAFE_SEARCH_FWD, strafe_dir * STRAFE_SEARCH_SPEED, 0)
+        else:
+            auto_state = STATE_LOST_REVERSE
+            strafe_search_start = None
+        return
+
+    # 4. STATE: LOST - REVERSING TO FIND LINE
     if auto_state == STATE_LOST_REVERSE:
         if active_count > 0:
             auto_state = STATE_LOST_PIVOT
-            lost_frame_counter = 0  # Reset counter
         else:
-            moveCurve(-RECOVERY_REVERSE_SPEED, -RECOVERY_REVERSE_SPEED)
+            moveVector(-RECOVERY_REVERSE_SPEED, 0, 0)
         return
 
-    # 3. STATE: LOST - PIVOTING TO RECENTER
+    # 5. STATE: LOST - PIVOTING TO RECENTER
     if auto_state == STATE_LOST_PIVOT:
-        # Calculate current turn strength to see if we are centered enough
         if active_count > 0:
             curr_turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
             if abs(curr_turn_var) <= 3.0:
                 auto_state = STATE_FOLLOWING
-                lost_frame_counter = 0 
+                reset_pid()
                 return
-        
-        # Pivot based on the memory of our last known direction
-        if last_turn_var > 0:
-            moveCurve(RECOVERY_PIVOT_SPEED, -RECOVERY_PIVOT_SPEED) # Pivot Right
-        else:
-            moveCurve(-RECOVERY_PIVOT_SPEED, RECOVERY_PIVOT_SPEED) # Pivot Left
+        pivot_dir = 1 if last_turn_var > 0 else -1
+        moveVector(0, 0, pivot_dir * RECOVERY_PIVOT_SPEED)
         return
 
-    # 4. STATE: ENDPOINT HANDLING
+    # 6. STATE: ENDPOINT / JUNCTION HANDLING
     if auto_state == STATE_ENDPOINT:
-        target_max_speed = ENDPOINT_TARGET_SPEED
-        turn_var = 0.0 # Go straight through the endpoint/junction
-
-        # Check for End/Gate patterns (11011 or 10001)
-        if internal_speed == ENDPOINT_TARGET_SPEED and (pattern == 0b11011 or pattern == 0b10001):
-            auto_state = STATE_STOPPED
-            print(">>> GATE DETECTED: HARD STOP")
+        if active_count == 5:
+            # Still all-on — check if this is a delivery zone (sustained)
+            if all_on_start_time is None:
+                all_on_start_time = current_time
+            elapsed_all_on = current_time - all_on_start_time
+            if elapsed_all_on >= DELIVERY_ZONE_TIME_THRESHOLD:
+                auto_state = STATE_PARKING
+                parking_start_time = current_time
+                all_on_start_time = None
+                print(">>> DELIVERY ZONE DETECTED — PARKING")
+                return
+            # Not yet confirmed as delivery zone — drive straight slowly
+            target_max_speed = ENDPOINT_TARGET_SPEED
+            if internal_speed < target_max_speed:
+                internal_speed = min(target_max_speed, internal_speed + ACCEL)
+            elif internal_speed > target_max_speed:
+                internal_speed = max(target_max_speed, internal_speed - DECEL)
+            moveVector(int(internal_speed * multiplier), 0, 0)
             return
-        
-        # If we crossed a junction and are back to a normal track (sum is 1, 2, or 3)
-        if 0 < active_count < 5 and pattern not in [0b11011, 0b10001]:
+
+        # Exited all-on zone
+        all_on_start_time = None
+        if 0 < active_count < 5:
             auto_state = STATE_FOLLOWING
+            reset_pid()
             print(">>> ENDPOINT CLEARED")
             return
-
-        # If we completely lose the line in a junction
         if active_count == 0:
-            auto_state = STATE_LOST_REVERSE
+            auto_state = STATE_LOST_STRAFE
+            strafe_search_start = current_time
             return
 
-    # 5. STATE: NORMAL FOLLOWING (Modified with debounce)
+    # 7. STATE: NORMAL FOLLOWING (PID + strafe + vector drive)
     if auto_state == STATE_FOLLOWING:
         if active_count == 0:
-            # Increment lost frame counter
-            lost_frame_counter += 1
-            
-            # Only declare lost if we've had NO line for LOST_DETECTION_DELAY seconds
-            if lost_frame_counter >= (LOST_DETECTION_DELAY * 60):  # 60 Hz update rate
-                auto_state = STATE_LOST_REVERSE
+            # Time-based lost detection
+            if lost_start_time is None:
+                lost_start_time = current_time
+            elapsed_lost = current_time - lost_start_time
+            if elapsed_lost >= LOST_DETECTION_DELAY:
+                auto_state = STATE_LOST_STRAFE
+                strafe_search_start = current_time
                 internal_speed = 0.0
-                print(f">>> LOST LINE: ENTERING RECOVERY after {lost_frame_counter} frames")
-                lost_frame_counter = 0
+                lost_start_time = None
+                print(f">>> LOST LINE: TRYING STRAFE RECOVERY")
             else:
-                # Still waiting to declare lost - maintain last command or gradually slow
-                print(f"Lost frame {lost_frame_counter}/{int(LOST_DETECTION_DELAY*60)}")
-                # Optionally slow down while waiting
+                # Slow down and drift in last direction while waiting
                 internal_speed = max(0.0, internal_speed - DECEL)
-                # Maintain last turn direction to keep trying to find line
-                if last_turn_var > 0:
-                    moveCurve(int(internal_speed * multiplier), -int(internal_speed * multiplier))
-                else:
-                    moveCurve(-int(internal_speed * multiplier), int(internal_speed * multiplier))
-                return
+                drift_omega = (1 if last_turn_var > 0 else -1) * int(internal_speed * multiplier * 0.5)
+                moveVector(int(internal_speed * multiplier), 0, drift_omega)
+            return
         else:
-            # Reset counter when we see line again
-            lost_frame_counter = 0
-            
-        # Continue with normal following logic if we have line
+            lost_start_time = None
+
+        # All 5 sensors on -> entering endpoint/junction
         if active_count == 5:
             auto_state = STATE_ENDPOINT
+            all_on_start_time = current_time
             print(">>> ALL SENSORS ON: ENTERING ENDPOINT")
-            target_max_speed = ENDPOINT_TARGET_SPEED
-            turn_var = 0.0 
-        else:
-            turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
-            last_turn_var = turn_var
-            
-            if turn_var == 0.0:
-                target_max_speed = 5.0
-            else:
-                target_max_speed = sum(b * m for b, m in zip(bits, MOVE_STRENGTHS)) / active_count
+            return
 
-    # --- Shared Physics & Steering (Applies to Following & Junctions) ---
-    
-    # Apply Smooth Acceleration / Deceleration
-    if internal_speed < target_max_speed:
-        internal_speed = min(target_max_speed, internal_speed + ACCEL)
-    elif internal_speed > target_max_speed:
-        internal_speed = max(target_max_speed, internal_speed - DECEL)
+        # --- Compute steering ---
+        turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
+        last_turn_var = turn_var
 
-    # Calculate Differential Steering
-    turn_ratio = abs(turn_var) / MAX_TURN_STRENGTH * 2
-    
-    # Delta V is the speed added to the fast wheel and subtracted from the slow wheel
-    delta_v = internal_speed * turn_ratio
+        # Adaptive target speed
+        target_max_speed = compute_target_speed(bits, turn_var)
 
-    if turn_var > 0: # Turning Right
-        left_algo  = (internal_speed + delta_v) * 1.3
-        right_algo = internal_speed - delta_v
-    elif turn_var < 0: # Turning Left
-        left_algo  = internal_speed - delta_v
-        right_algo = (internal_speed + delta_v) * 1.3
-    else: # Straight
-        left_algo = right_algo = internal_speed
+        # Smooth acceleration / deceleration
+        if internal_speed < target_max_speed:
+            internal_speed = min(target_max_speed, internal_speed + ACCEL)
+        elif internal_speed > target_max_speed:
+            internal_speed = max(target_max_speed, internal_speed - DECEL)
 
-    # --- SAFETY CAP FOR MOTORS ---
-    # Because the outside wheel over-speeds to maintain center velocity, 
-    # we must ensure it doesn't try to exceed the physical MAX_SPEED (100).
-    left_motor  = max(-MAX_SPEED, min(MAX_SPEED, int(round(left_algo * multiplier))))
-    right_motor = max(-MAX_SPEED, min(MAX_SPEED, int(round(right_algo * multiplier))))
+        # PID for rotation (omega)
+        dt = current_time - pid_last_time
+        pid_last_time = current_time
+        omega_raw = pid_compute(turn_var, dt)
 
-    moveCurve(left_motor, right_motor)
+        # Strafe correction (mecanum advantage: small errors -> strafe, large -> rotate)
+        vy_raw = compute_strafe_correction(turn_var)
+
+        # Convert to motor commands
+        vx = int(internal_speed * multiplier)
+        vy = max(-MAX_SPEED, min(MAX_SPEED, int(vy_raw * multiplier / 5.0)))
+        omega = max(-MAX_SPEED, min(MAX_SPEED, int(omega_raw * multiplier / 5.0)))
+        omega = int(rate_limit_omega(omega))
+
+        debug_vx, debug_vy, debug_omega = vx, vy, omega
+        moveVector(vx, vy, omega)
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +432,10 @@ if __name__ == "__main__":
     t_uart.start()
 
     pygame.init()
-    screen = pygame.display.set_mode((400, 300))
-    pygame.display.set_caption("Algorithmic Line Follower")
-    font = pygame.font.SysFont(None, 28)
+    screen = pygame.display.set_mode((480, 420))
+    pygame.display.set_caption("Alfred Line Follower v2")
+    font = pygame.font.SysFont(None, 26)
+    font_sm = pygame.font.SysFont(None, 22)
 
     pressed = {'w': False, 's': False, 'a': False, 'd': False, 'q': False, 'e': False}
 
@@ -326,20 +454,55 @@ if __name__ == "__main__":
     while running:
         screen.fill((30, 30, 30))
         mode_color = (0, 220, 100) if auto_mode else (220, 180, 0)
-        mode_label = "AUTO (Algorithmic)" if auto_mode else "MANUAL (WASD+QE)"
-        
+        mode_label = "AUTO (PID+Vector)" if auto_mode else "MANUAL (WASD+QE)"
+
         bits = get_ir_bits()
         active = sum(bits)
         turn_display = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active if active > 0 else 0.0
 
-        screen.blit(font.render(f"MODE: {mode_label}", True, mode_color), (20, 20))
-        screen.blit(font.render(f"Max Speed Scalar: {current_speed}", True, (200,200,200)), (20, 60))
-        screen.blit(font.render(f"Internal Algo Spd: {internal_speed:.2f}", True, (200,200,200)), (20, 90))
-        screen.blit(font.render(f"Turn Strength: {(turn_var / MAX_TURN_STRENGTH * 2):.2f}", True, (200,200,200)), (20, 120))
-        screen.blit(font.render(f"W={bits[0]} NW={bits[1]} N={bits[2]} NE={bits[3]} E={bits[4]}", True, (100,180,255)), (20, 160))
-        screen.blit(font.render(f"Calc Turn Var: {turn_display:.2f}", True, (100,180,255)), (20, 190))
-        screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, (180,220,180)), (20, 230))
-        
+        # State color coding
+        state_colors = {
+            STATE_FOLLOWING: (0, 220, 100),    # Green
+            STATE_ENDPOINT: (220, 220, 0),     # Yellow
+            STATE_LOST_REVERSE: (220, 50, 50), # Red
+            STATE_LOST_PIVOT: (220, 100, 50),  # Orange
+            STATE_LOST_STRAFE: (220, 150, 50), # Light orange
+            STATE_STOPPED: (150, 150, 150),    # Gray
+            STATE_PARKING: (50, 100, 220),     # Blue
+        }
+        st_color = state_colors.get(auto_state, (180, 220, 180))
+
+        y = 10
+        screen.blit(font.render(f"MODE: {mode_label}", True, mode_color), (20, y)); y += 30
+        screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, st_color), (20, y)); y += 30
+        screen.blit(font.render(f"Speed: {current_speed}  Algo: {internal_speed:.2f}", True, (200,200,200)), (20, y)); y += 28
+
+        # Sensor display — visual boxes
+        sensor_names = ['W', 'NW', 'N', 'NE', 'E']
+        sx = 20
+        for i, name in enumerate(sensor_names):
+            color = (0, 200, 0) if bits[i] else (80, 80, 80)
+            pygame.draw.rect(screen, color, (sx, y, 40, 25))
+            screen.blit(font_sm.render(name, True, (255,255,255)), (sx + 5, y + 3))
+            sx += 50
+        y += 35
+
+        screen.blit(font_sm.render(f"Turn Var: {turn_display:+.2f}", True, (100,180,255)), (20, y)); y += 22
+
+        # PID debug
+        screen.blit(font_sm.render(f"PID  P:{debug_pid_p:+.1f}  I:{debug_pid_i:+.1f}  D:{debug_pid_d:+.1f}", True, (180,180,255)), (20, y)); y += 22
+
+        # Vector output
+        screen.blit(font_sm.render(f"Vector  vx:{debug_vx}  vy:{debug_vy}  omega:{debug_omega}", True, (180,255,180)), (20, y)); y += 22
+
+        # Delivery zone timer
+        if all_on_start_time is not None:
+            zone_t = time.time() - all_on_start_time
+            screen.blit(font_sm.render(f"All-ON timer: {zone_t:.2f}s / {DELIVERY_ZONE_TIME_THRESHOLD}s", True, (50,100,220)), (20, y))
+        y += 22
+
+        screen.blit(font_sm.render("Keys: M=auto  WASD+QE=manual  1/2=speed  Esc=quit", True, (120,120,120)), (20, y))
+
         pygame.display.flip()
 
         for event in pygame.event.get():
@@ -353,6 +516,7 @@ if __name__ == "__main__":
                     if auto_mode:
                         auto_state = STATE_FOLLOWING
                         internal_speed = 0.0
+                        reset_pid()
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
                 elif event.key == pygame.K_s:      pressed['s'] = True;  update_movement()
                 elif event.key == pygame.K_a:      pressed['a'] = True;  update_movement()

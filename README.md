@@ -28,7 +28,7 @@ Alfred is a **4-wheeled mecanum robot** that can follow black lines on a white s
 
 ### 1. `src/main.cpp` — ESP32-S3 Firmware (PlatformIO/Arduino)
 
-This is the **dumb actuator layer**. It does three things:
+This is the **actuator layer**. It does three things:
 
 - **Reads IR sensors** at 20 Hz and broadcasts `IR_STATUS:<bitmask>` over UART to the Pi. The bitmask is 5 bits: `bit0=W, bit1=NW, bit2=N, bit3=NE, bit4=E`.
 - **Receives movement commands** over UART in `command:params` format and drives the motors accordingly.
@@ -45,10 +45,27 @@ Supported commands:
 | `mv_turnleft` | speed | Tank rotate CCW (left side backward, right side forward) |
 | `mv_turnright` | speed | Tank rotate CW |
 | `mv_curve` | left,right | Differential steering — independent speed per side, negative = reverse |
+| `mv_vector` | vx,vy,omega | **Mecanum inverse kinematics** — forward, strafe, and rotation in one command |
 | `mv_sidepivot` | frontSpeed,rearPercent,direction | Front wheels oppose hard, rear wheels crawl — pivots around rear axle |
 | `stop` | 0 | All motors stop |
 
 Speed values are 0–100 percent, mapped internally to PWM range 50–200.
+
+#### Mecanum Inverse Kinematics (`mv_vector`)
+
+The `mv_vector` command takes three values (-100 to 100 each):
+- `vx` = forward (+) / backward (-)
+- `vy` = strafe right (+) / strafe left (-)
+- `omega` = rotate CW (+) / rotate CCW (-)
+
+Each wheel speed is computed as:
+```
+FL (Motor A) = vx + vy + omega
+FR (Motor B) = vx - vy - omega
+RL (Motor C) = vx - vy + omega
+RR (Motor D) = vx + vy - omega
+```
+If any wheel exceeds 100, all are scaled down proportionally to preserve the motion vector.
 
 ### 2. `Minilab5/linefollower.py` — Raspberry Pi Controller (Python + Pygame)
 
@@ -56,28 +73,46 @@ This is the **brain**. It runs a pygame GUI with two modes:
 
 **Manual Mode (default):** WASD for movement, QE for tank rotation, 1/2 to adjust speed, Space to stop.
 
-**Auto Mode (press M):** A finite state machine (FSM) that follows a black line using weighted sensor fusion and differential steering.
+**Auto Mode (press M):** A finite state machine (FSM) that follows a black line using PID control, mecanum strafe correction, and adaptive speed.
 
 ## The Line-Following Algorithm (FSM)
 
-The auto mode has **5 states**:
+The auto mode has **7 states**:
 
-### `STATE_FOLLOWING` — Normal line tracking
+### `STATE_FOLLOWING` — Normal line tracking (PID + strafe + vector drive)
 
-- Reads the 5 IR sensor bits and computes two values:
-  - **`turn_var`** — weighted average of active sensors using `TURN_STRENGTHS = [-7, -4.5, 0, 4.5, 7]`. Negative = line is left, positive = line is right, zero = centered. This tells the robot *which direction to steer*.
-  - **`target_max_speed`** — weighted average using `MOVE_STRENGTHS = [3.8, 4.2, 5.0, 4.2, 3.8]`. Center sensor gives max speed (5.0), side sensors give lower speed. This makes the robot *slow down on curves*.
-- `internal_speed` (0.0–5.0) ramps toward `target_max_speed` using acceleration/deceleration constants (`ACCEL=0.20`, `DECEL=0.12`).
-- **Differential steering**: `turn_ratio = |turn_var| / MAX_TURN_STRENGTH * 2` creates a speed difference (`delta_v`) between left and right wheels. The outer wheel gets a 1.3x boost for sharper turns. Final motor speeds are `internal_speed * multiplier` where `multiplier = current_speed / 5.0`.
+- Reads the 5 IR sensor bits and computes **`turn_var`** — weighted average of active sensors using `TURN_STRENGTHS = [-7, -4.5, 0, 4.5, 7]`. Negative = line is left, positive = line is right, zero = centered.
+- A **PID controller** processes `turn_var` to produce `omega` (rotation):
+  - **P** (proportional) = immediate steering response
+  - **I** (integral) = eliminates drift on sustained curves
+  - **D** (derivative) = dampens oscillation, critical for tray stability
+- **Strafe correction** adds a `vy` component for small errors — the robot slides sideways instead of rotating, keeping heading aligned and the tray stable. For larger errors, rotation takes over.
+- **Adaptive speed** automatically goes fast on straights (center sensor only = 5.0) and slows on curves (outer sensors = 2.0–3.0).
+- `internal_speed` (0.0–5.0) ramps toward target using acceleration/deceleration constants.
+- An **omega rate limiter** caps how quickly rotation can change per tick, preventing sudden jerky turns.
+- All three components (`vx`, `vy`, `omega`) are sent via `moveVector()` to use the full mecanum capability.
 - If **all 5 sensors** fire → transitions to `STATE_ENDPOINT`.
-- If **no sensors** fire for `LOST_DETECTION_DELAY` (0.5s) worth of frames → transitions to `STATE_LOST_REVERSE`. During the delay, it keeps turning in the last known direction while slowing down.
+- If **no sensors** fire for `LOST_DETECTION_DELAY` (0.5s) → transitions to `STATE_LOST_STRAFE`.
 
-### `STATE_ENDPOINT` — Junction / crossbar handling
+### `STATE_ENDPOINT` — Junction / delivery zone handling
 
-- Robot goes straight at reduced speed (`ENDPOINT_TARGET_SPEED = 2.0`).
-- If it sees gate patterns (`11011` or `10001`) at endpoint speed → hard stop (`STATE_STOPPED`).
-- If sensor count drops back to 1–3 (normal track) → returns to `STATE_FOLLOWING`.
-- If all sensors go dark → `STATE_LOST_REVERSE`.
+- Robot drives straight at reduced speed (`ENDPOINT_TARGET_SPEED = 2.0`).
+- A **timer** tracks how long all 5 sensors stay on:
+  - Short all-on (< 0.4s) = junction crossbar → drives through, returns to `STATE_FOLLOWING`.
+  - Sustained all-on (>= 0.4s) = delivery zone → transitions to `STATE_PARKING`.
+- If all sensors go dark → `STATE_LOST_STRAFE`.
+
+### `STATE_PARKING` — Delivery zone parking
+
+- Crawls forward at low speed (`PARKING_SPEED = 15`) for `PARKING_DRIVE_TIME` (0.8s) to center all wheels in the zone.
+- Then stops permanently and disables auto mode.
+
+### `STATE_LOST_STRAFE` — Strafe recovery (first attempt)
+
+- Strafes sideways in the last known line direction for 0.4s with slight forward motion.
+- If the line is found → returns to `STATE_FOLLOWING`.
+- If not found → falls back to `STATE_LOST_REVERSE`.
+- Much gentler than immediately reversing — less tray sway.
 
 ### `STATE_LOST_REVERSE` — Backtrack recovery
 
@@ -100,7 +135,7 @@ Pi (linefollower.py)                    ESP32 (main.cpp)
        |                                      |
        |  <-- "IR_STATUS:12\n" (20 Hz) ----  |  (sensor broadcast)
        |                                      |
-       |  ---- "mv_curve:45,30\n" -------->  |  (motor command)
+       |  ---- "mv_vector:30,5,12\n" ----->  |  (vector drive command)
        |                                      |
        |  <-- "Hello from ESP32\n" --------  |  (heartbeat)
 ```
@@ -112,14 +147,41 @@ Pi (linefollower.py)                    ESP32 (main.cpp)
 
 ## Key Tuning Parameters
 
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `TURN_STRENGTHS` | [-7, -4.5, 0, 4.5, 7] | How aggressively each sensor pulls steering |
-| `MOVE_STRENGTHS` | [3.8, 4.2, 5.0, 4.2, 3.8] | Target speed per sensor (center = fastest) |
+### PID Tuning (most important)
+
+| Parameter | Default | What it does | Increase if... | Decrease if... |
+|-----------|---------|-------------|----------------|----------------|
+| `KP` | 18.0 | Main steering response | Robot slow to react to curves | Robot oscillates/wobbles |
+| `KI` | 0.5 | Fixes steady drift on curves | Robot drifts to outside of curves | Robot overshoots after curves |
+| `KD` | 12.0 | Dampens oscillation | Robot oscillates on straights | Robot sluggish entering curves |
+| `PID_I_MAX` | 50.0 | Anti-windup clamp for I term | Unlikely to need change | I term causes overshoot |
+
+**Tuning order:** Set `KI=0, KD=0`. Increase `KP` until it follows but wobbles. Add `KD` until wobble is gone. Add small `KI` to fix curve drift. If tray sways, increase `KD`.
+
+### Strafe & Speed Tuning
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `STRAFE_GAIN` | 8.0 | How hard it strafes sideways for small corrections |
+| `STRAFE_WEIGHT_THRESHOLD` | 3.0 | Error below this = pure strafe (no rotation) |
+| `OMEGA_RATE_LIMIT` | 5.0 | Max rotation change per tick (tray stability) |
+| `DEFAULT_SPEED` | 35 | Master speed scalar |
 | `ACCEL / DECEL` | 0.20 / 0.12 | Ramp rates for smooth speed transitions |
-| `DEFAULT_SPEED` | 35 | Master speed scalar (multiplied with algo's 0–5 output) |
+
+### Delivery Zone & Recovery
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `DELIVERY_ZONE_TIME_THRESHOLD` | 0.4s | How long all-5-ON must persist to count as delivery zone |
+| `PARKING_DRIVE_TIME` | 0.8s | How far to crawl into zone after detection |
 | `LOST_DETECTION_DELAY` | 0.5s | Debounce before declaring line lost |
-| `MAX_TURN_STRENGTH` | 9.0 | Normalizer for differential steering ratio |
+| `STRAFE_SEARCH_DURATION` | 0.4s | How long to strafe-search before falling back to reverse |
+
+### Quick Start Presets
+
+- **Conservative (stable tray):** `DEFAULT_SPEED=25, KP=12, KD=15, OMEGA_RATE_LIMIT=3`
+- **Balanced (good speed + stability):** `DEFAULT_SPEED=35, KP=18, KD=12, OMEGA_RATE_LIMIT=5`
+- **Aggressive (fastest time):** `DEFAULT_SPEED=50, KP=24, KD=10, OMEGA_RATE_LIMIT=8`
 
 ## Controls (Raspberry Pi GUI)
 
@@ -154,3 +216,36 @@ Pi (linefollower.py)                    ESP32 (main.cpp)
    ```
    python Minilab5/linefollower.py
    ```
+
+---
+
+## Changelog
+
+### V2 (2026-03-26) — PID + Mecanum Vector Drive + Parking
+
+**Bug Fixes:**
+- Fixed `lost_frame_counter` crash (was used but never initialized)
+- Fixed 60Hz vs 30Hz lost detection mismatch (now time-based)
+- Removed dead `LOST_DETECTION_FRAMES` code
+
+**ESP32 Firmware:**
+- Added `mv_vector:vx,vy,omega` command with mecanum inverse kinematics
+- Added `vectorDrive()` and `driveWheel()` functions
+- All existing commands unchanged
+
+**Pi Controller — New Features:**
+- **PID controller** replaces old 1.3x outer-wheel-boost differential steering
+- **Strafe correction** — small errors use sideways sliding instead of rotation (tray stays stable)
+- **Delivery zone parking** — time-based detection (all-5-ON > 0.4s), crawls to center, stops permanently
+- **Strafe recovery** — tries lateral search before falling back to reverse+pivot
+- **Adaptive speed** — automatically fast on straights, slow on curves
+- **Omega rate limiter** — caps rotation change per tick for tray stability
+- **Enhanced GUI** — color-coded FSM state, visual sensor boxes, PID breakdown, vector output display, delivery zone timer
+
+### V1 (2026-03-25) — Initial Release
+
+- 5-sensor weighted fusion with differential steering
+- Frame-based lost detection with debounce
+- Reverse + pivot recovery
+- Gate pattern detection (11011, 10001)
+- Manual WASD+QE control with Pygame GUI

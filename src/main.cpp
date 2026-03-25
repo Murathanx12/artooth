@@ -342,6 +342,63 @@ uint8_t readIrStatus()
 }
 
 // ============================================================
+// Mecanum vector drive (inverse kinematics)
+// ============================================================
+
+void driveWheel(char wheel, int speed)
+{
+  int pwm = speedToPwm(abs(speed));
+  switch (wheel) {
+    case 'A':
+      if (speed > 0) MOTORA_FORWARD(pwm);
+      else if (speed < 0) MOTORA_BACKOFF(pwm);
+      else MOTORA_STOP(0);
+      break;
+    case 'B':
+      if (speed > 0) MOTORB_FORWARD(pwm);
+      else if (speed < 0) MOTORB_BACKOFF(pwm);
+      else MOTORB_STOP(0);
+      break;
+    case 'C':
+      if (speed > 0) MOTORC_FORWARD(pwm);
+      else if (speed < 0) MOTORC_BACKOFF(pwm);
+      else MOTORC_STOP(0);
+      break;
+    case 'D':
+      if (speed > 0) MOTORD_FORWARD(pwm);
+      else if (speed < 0) MOTORD_BACKOFF(pwm);
+      else MOTORD_STOP(0);
+      break;
+  }
+}
+
+// vx = forward (+) / backward (-)
+// vy = strafe right (+) / strafe left (-)
+// omega = rotate CW/right (+) / rotate CCW/left (-)
+// All values: -100 to 100
+void vectorDrive(int vx, int vy, int omega)
+{
+  int fl = vx + vy + omega;   // Motor A (left front)
+  int fr = vx - vy - omega;   // Motor B (right front)
+  int rl = vx - vy + omega;   // Motor C (left rear)
+  int rr = vx + vy - omega;   // Motor D (right rear)
+
+  // Normalize: if any wheel exceeds 100, scale all down proportionally
+  int maxVal = max(max(abs(fl), abs(fr)), max(abs(rl), abs(rr)));
+  if (maxVal > 100) {
+    fl = fl * 100 / maxVal;
+    fr = fr * 100 / maxVal;
+    rl = rl * 100 / maxVal;
+    rr = rr * 100 / maxVal;
+  }
+
+  driveWheel('A', fl);
+  driveWheel('B', fr);
+  driveWheel('C', rl);
+  driveWheel('D', rr);
+}
+
+// ============================================================
 // UART command handling
 // ============================================================
 
@@ -385,6 +442,16 @@ void handleCommand(const String& commandName, const String& paramsStr)
       int ls = paramsStr.substring(0, ci).toInt();
       int rs = paramsStr.substring(ci + 1).toInt();
       curve(ls, rs);
+    }
+  } else if (commandName == "mv_vector") {
+    // Format: mv_vector:vx,vy,omega
+    int c1 = paramsStr.indexOf(',');
+    int c2 = paramsStr.indexOf(',', c1 + 1);
+    if (c1 != -1 && c2 != -1) {
+      int vx = paramsStr.substring(0, c1).toInt();
+      int vy = paramsStr.substring(c1 + 1, c2).toInt();
+      int omega = paramsStr.substring(c2 + 1).toInt();
+      vectorDrive(vx, vy, omega);
     }
   } else if (commandName == "stop") {
     STOP();
