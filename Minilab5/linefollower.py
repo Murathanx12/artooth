@@ -10,27 +10,22 @@ import pygame
 # ===========================================================================
 
 # -- Sensor Configuration --
-REVERSE_SENSOR_ORDER = False
-
-# -- Distance Integration Thresholds --
-# Instead of counting frames or time, we integrate speed*dt to estimate
-# distance traveled while a condition holds. Units are arbitrary
-# (internal_speed * seconds).
-LOST_DISTANCE_THRESHOLD     = 1.5   # integrated distance with no line before recovery
-ENDPOINT_DISTANCE_THRESHOLD = 0.8   # integrated distance with all sensors on before gate check
+REVERSE_SENSOR_ORDER = False 
+LOST_DETECTION_DELAY = 0.5
+LOST_DETECTION_FRAMES = 0
 
 # -- Algorithm Weights (W, NW, N, NE, E) --
 TURN_STRENGTHS = [-7, -4.5, 0.0, 4.5, 7]
-MOVE_STRENGTHS = [3.8, 4.6, 5.0, 4.6, 3.8]
+MOVE_STRENGTHS = [3.8, 4.2, 5.0, 4.2, 3.8]
 
 # -- Speed & Physics Limits --
 MIN_SPEED       = 10       # lowest usable motor speed
 MAX_SPEED       = 120     # highest motor speed
-DEFAULT_SPEED   = 35      # Base multiplier setting
+DEFAULT_SPEED   = 35      # Base multiplier setting (Algorithm outputs 0-5. 5 * 10 = 50 motor speed)
 
 ACCEL = 0.20  # Speed gained per tick
 DECEL = 0.12  # Speed lost per tick
-MAX_TURN_STRENGTH = 9.0
+MAX_TURN_STRENGTH = 9.0 
 
 # Add a rate limiter
 last_control_time = 0
@@ -38,8 +33,7 @@ CONTROL_INTERVAL = 0.033  # 30 Hz instead of 60 Hz
 
 # -- Recovery & Junction Parameters --
 RECOVERY_REVERSE_SPEED = 20
-RECOVERY_SIDEPIVOT_FRONT_SPEED = 25  # Front wheel speed for side pivot
-RECOVERY_SIDEPIVOT_REAR_PCT    = 15  # Rear wheels at 15% of front speed
+RECOVERY_PIVOT_SPEED   = 18
 ENDPOINT_TARGET_SPEED  = 2.0  # Out of 5.0
 
 # -- UART --
@@ -70,11 +64,6 @@ internal_speed = 0.0 # Tracks the 0.0 to 5.0 algorithmic speed
 last_turn_var  = 0.0 # Memory for which way we were turning before getting lost
 turn_var = 0.0
 
-# Distance integration accumulators
-lost_distance_accum     = 0.0  # accumulated distance while line is lost
-endpoint_distance_accum = 0.0  # accumulated distance while on endpoint (all sensors)
-prev_tick_time          = 0.0  # timestamp of previous tick for dt calculation
-
 STATE_NAMES = {
     STATE_FOLLOWING:    "FOLLOW",
     STATE_ENDPOINT:     "ENDPOINT",
@@ -84,7 +73,7 @@ STATE_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
-# UART & Movement Functions
+# UART & Movement Functions (Kept identical for hardware compatibility)
 # ---------------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
@@ -102,13 +91,21 @@ def moveTurnRight(speed): sendSerialCommand('mv_turnright', [speed])
 def stopAll(): sendSerialCommand('stop', [0])
 def moveCurve(left_speed, right_speed): sendSerialCommand('mv_curve', [left_speed, right_speed])
 
-def moveSidePivot(front_speed, rear_percent, direction):
-    """Side pivot: front wheels oppose at high speed, rear crawl or stop.
-    direction: 1 = pivot right, -1 = pivot left"""
-    sendSerialCommand('mv_sidepivot', [front_speed, rear_percent, direction])
-
 # ---------------------------------------------------------------------------
 # IR Sensor Helpers
+#   Sensor output: 1 = black line detected, 0 = white / no line
+#
+#         [N]  North (center front)
+#        /   \
+#     [NW]   [NE]
+#     /         \
+#   [W]         [E]
+#
+#   bit0 = GPIO5  = W   (West / far left)
+#   bit1 = GPIO6  = NW  (Northwest)
+#   bit2 = GPIO7  = N   (North / center front)
+#   bit3 = GPIO15 = NE  (Northeast)
+#   bit4 = GPIO45 = E   (East / far right)
 # ---------------------------------------------------------------------------
 IDX_W, IDX_NW, IDX_N, IDX_NE, IDX_E = 0, 1, 2, 3, 4
 
@@ -124,7 +121,7 @@ def get_ir_bits():
 # ---------------------------------------------------------------------------
 def line_follow_step():
     global auto_state, internal_speed, last_turn_var, current_speed, turn_var
-    global lost_distance_accum, endpoint_distance_accum, prev_tick_time
+    global lost_frame_counter
     global last_control_time
 
     current_time = time.time()
@@ -132,142 +129,141 @@ def line_follow_step():
         return
     last_control_time = current_time
 
-    # Calculate dt for distance integration
-    if prev_tick_time == 0.0:
-        dt = CONTROL_INTERVAL  # first tick, assume one interval
-    else:
-        dt = current_time - prev_tick_time
-    prev_tick_time = current_time
-
     bits = get_ir_bits()
     active_count = sum(bits)
     pattern = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
-
+    
     # Speed multiplier (maps 0.0-5.0 scale to actual motor speed)
-    multiplier = current_speed / 5.0
+    multiplier = current_speed / 5.0 
 
     # 1. STATE: STOPPED / BRAKING
     if auto_state == STATE_STOPPED:
         if internal_speed > 0:
+            # Gently ramp down the speed to prevent spilling
             internal_speed = max(0.0, internal_speed - DECEL*5)
             left_motor  = int(round(internal_speed * multiplier))
             right_motor = int(round(internal_speed * multiplier))
             moveCurve(left_motor, right_motor)
         else:
-            stopAll()
+            stopAll() # Only lock motors once speed has gracefully reached 0
         return
 
     # 2. STATE: LOST - REVERSING TO FIND LINE
     if auto_state == STATE_LOST_REVERSE:
         if active_count > 0:
             auto_state = STATE_LOST_PIVOT
-            lost_distance_accum = 0.0
+            lost_frame_counter = 0  # Reset counter
         else:
             moveCurve(-RECOVERY_REVERSE_SPEED, -RECOVERY_REVERSE_SPEED)
         return
 
-    # 3. STATE: LOST - SIDE PIVOT TO RECENTER
+    # 3. STATE: LOST - PIVOTING TO RECENTER
     if auto_state == STATE_LOST_PIVOT:
+        # Calculate current turn strength to see if we are centered enough
         if active_count > 0:
             curr_turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
             if abs(curr_turn_var) <= 3.0:
                 auto_state = STATE_FOLLOWING
-                lost_distance_accum = 0.0
+                lost_frame_counter = 0 
                 return
-
-        # Side pivot: front wheels fast in opposing directions, rear wheels slow
-        direction = 1 if last_turn_var > 0 else -1
-        moveSidePivot(RECOVERY_SIDEPIVOT_FRONT_SPEED, RECOVERY_SIDEPIVOT_REAR_PCT, direction)
+        
+        # Pivot based on the memory of our last known direction
+        if last_turn_var > 0:
+            moveCurve(RECOVERY_PIVOT_SPEED, -RECOVERY_PIVOT_SPEED) # Pivot Right
+        else:
+            moveCurve(-RECOVERY_PIVOT_SPEED, RECOVERY_PIVOT_SPEED) # Pivot Left
         return
 
-    # 4. STATE: ENDPOINT HANDLING (distance-integrated)
+    # 4. STATE: ENDPOINT HANDLING
     if auto_state == STATE_ENDPOINT:
         target_max_speed = ENDPOINT_TARGET_SPEED
-        turn_var = 0.0
+        turn_var = 0.0 # Go straight through the endpoint/junction
 
-        # Integrate distance while in endpoint state
-        endpoint_distance_accum += internal_speed * dt
-
-        # Check for End/Gate patterns only after traveling enough distance
-        if endpoint_distance_accum >= ENDPOINT_DISTANCE_THRESHOLD and (pattern == 0b11011 or pattern == 0b10001):
+        # Check for End/Gate patterns (11011 or 10001)
+        if internal_speed == ENDPOINT_TARGET_SPEED and (pattern == 0b11011 or pattern == 0b10001):
             auto_state = STATE_STOPPED
-            endpoint_distance_accum = 0.0
-            print(f">>> GATE DETECTED: HARD STOP (dist={endpoint_distance_accum:.2f})")
+            print(">>> GATE DETECTED: HARD STOP")
             return
-
-        # If we crossed a junction and are back to a normal track
+        
+        # If we crossed a junction and are back to a normal track (sum is 1, 2, or 3)
         if 0 < active_count < 5 and pattern not in [0b11011, 0b10001]:
             auto_state = STATE_FOLLOWING
-            endpoint_distance_accum = 0.0
             print(">>> ENDPOINT CLEARED")
             return
 
         # If we completely lose the line in a junction
         if active_count == 0:
             auto_state = STATE_LOST_REVERSE
-            endpoint_distance_accum = 0.0
             return
 
-    # 5. STATE: NORMAL FOLLOWING (distance-integrated lost detection)
+    # 5. STATE: NORMAL FOLLOWING (Modified with debounce)
     if auto_state == STATE_FOLLOWING:
         if active_count == 0:
-            # Integrate distance traveled while lost
-            # Use max(internal_speed, 1.0) so even stopped robots eventually trigger recovery
-            effective_speed = max(internal_speed, 1.0)
-            lost_distance_accum += effective_speed * dt
-
-            if lost_distance_accum >= LOST_DISTANCE_THRESHOLD:
+            # Increment lost frame counter
+            lost_frame_counter += 1
+            
+            # Only declare lost if we've had NO line for LOST_DETECTION_DELAY seconds
+            if lost_frame_counter >= (LOST_DETECTION_DELAY * 60):  # 60 Hz update rate
                 auto_state = STATE_LOST_REVERSE
                 internal_speed = 0.0
-                print(f">>> LOST LINE: ENTERING RECOVERY after dist={lost_distance_accum:.2f}")
-                lost_distance_accum = 0.0
+                print(f">>> LOST LINE: ENTERING RECOVERY after {lost_frame_counter} frames")
+                lost_frame_counter = 0
             else:
-                # Still accumulating — slow down and drift in last known direction
+                # Still waiting to declare lost - maintain last command or gradually slow
+                print(f"Lost frame {lost_frame_counter}/{int(LOST_DETECTION_DELAY*60)}")
+                # Optionally slow down while waiting
                 internal_speed = max(0.0, internal_speed - DECEL)
+                # Maintain last turn direction to keep trying to find line
                 if last_turn_var > 0:
                     moveCurve(int(internal_speed * multiplier), -int(internal_speed * multiplier))
                 else:
                     moveCurve(-int(internal_speed * multiplier), int(internal_speed * multiplier))
                 return
         else:
-            # Reset distance accumulator when we see line again
-            lost_distance_accum = 0.0
-
+            # Reset counter when we see line again
+            lost_frame_counter = 0
+            
         # Continue with normal following logic if we have line
         if active_count == 5:
             auto_state = STATE_ENDPOINT
-            endpoint_distance_accum = 0.0
             print(">>> ALL SENSORS ON: ENTERING ENDPOINT")
             target_max_speed = ENDPOINT_TARGET_SPEED
-            turn_var = 0.0
+            turn_var = 0.0 
         else:
             turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
             last_turn_var = turn_var
-
+            
             if turn_var == 0.0:
                 target_max_speed = 5.0
             else:
                 target_max_speed = sum(b * m for b, m in zip(bits, MOVE_STRENGTHS)) / active_count
 
-    # --- Shared Physics & Steering ---
-
+    # --- Shared Physics & Steering (Applies to Following & Junctions) ---
+    
+    # Apply Smooth Acceleration / Deceleration
     if internal_speed < target_max_speed:
         internal_speed = min(target_max_speed, internal_speed + ACCEL)
     elif internal_speed > target_max_speed:
         internal_speed = max(target_max_speed, internal_speed - DECEL)
 
+    # Calculate Differential Steering
     turn_ratio = abs(turn_var) / MAX_TURN_STRENGTH * 2
+    
+    # Delta V is the speed added to the fast wheel and subtracted from the slow wheel
     delta_v = internal_speed * turn_ratio
 
-    if turn_var > 0:
+    if turn_var > 0: # Turning Right
         left_algo  = (internal_speed + delta_v) * 1.3
         right_algo = internal_speed - delta_v
-    elif turn_var < 0:
+    elif turn_var < 0: # Turning Left
         left_algo  = internal_speed - delta_v
         right_algo = (internal_speed + delta_v) * 1.3
-    else:
+    else: # Straight
         left_algo = right_algo = internal_speed
 
+    # --- SAFETY CAP FOR MOTORS ---
+    # Because the outside wheel over-speeds to maintain center velocity, 
+    # we must ensure it doesn't try to exceed the physical MAX_SPEED (100).
     left_motor  = max(-MAX_SPEED, min(MAX_SPEED, int(round(left_algo * multiplier))))
     right_motor = max(-MAX_SPEED, min(MAX_SPEED, int(round(right_algo * multiplier))))
 
@@ -331,7 +327,7 @@ if __name__ == "__main__":
         screen.fill((30, 30, 30))
         mode_color = (0, 220, 100) if auto_mode else (220, 180, 0)
         mode_label = "AUTO (Algorithmic)" if auto_mode else "MANUAL (WASD+QE)"
-
+        
         bits = get_ir_bits()
         active = sum(bits)
         turn_display = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active if active > 0 else 0.0
@@ -341,9 +337,9 @@ if __name__ == "__main__":
         screen.blit(font.render(f"Internal Algo Spd: {internal_speed:.2f}", True, (200,200,200)), (20, 90))
         screen.blit(font.render(f"Turn Strength: {(turn_var / MAX_TURN_STRENGTH * 2):.2f}", True, (200,200,200)), (20, 120))
         screen.blit(font.render(f"W={bits[0]} NW={bits[1]} N={bits[2]} NE={bits[3]} E={bits[4]}", True, (100,180,255)), (20, 160))
-        screen.blit(font.render(f"Lost dist: {lost_distance_accum:.2f}  EP dist: {endpoint_distance_accum:.2f}", True, (100,180,255)), (20, 190))
+        screen.blit(font.render(f"Calc Turn Var: {turn_display:.2f}", True, (100,180,255)), (20, 190))
         screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, (180,220,180)), (20, 230))
-
+        
         pygame.display.flip()
 
         for event in pygame.event.get():
@@ -357,9 +353,6 @@ if __name__ == "__main__":
                     if auto_mode:
                         auto_state = STATE_FOLLOWING
                         internal_speed = 0.0
-                        lost_distance_accum = 0.0
-                        endpoint_distance_accum = 0.0
-                        prev_tick_time = 0.0
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
                 elif event.key == pygame.K_s:      pressed['s'] = True;  update_movement()
                 elif event.key == pygame.K_a:      pressed['a'] = True;  update_movement()
