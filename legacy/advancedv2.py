@@ -12,7 +12,7 @@ import pygame
 
 # -- Sensor Configuration --
 REVERSE_SENSOR_ORDER = False
-LOST_DETECTION_DELAY = 1.2      # Seconds of no-line before declaring LOST
+LOST_DETECTION_DELAY = 0.5      # Seconds of no-line before declaring LOST
 
 # -- Algorithm Weights (W, NW, N, NE, E) --
 TURN_STRENGTHS = [-7, -4.5, 0.0, 4.5, 7]
@@ -30,7 +30,6 @@ MAX_TURN_STRENGTH = 9.0
 # -- Curve Handling --
 # On sharp curves: slow way down + strong rotation (like pressing Q/E + gentle W)
 OMEGA_GAIN       = 4.5     # Rotation strength for heading correction
-SWEEP_TURN_SPEED = 55      # Rotation speed when sweeping to re-find line during a turn
 CURVE_SLOW_FACTOR = 0.20   # At max turn, forward speed drops to 20% (slow crawl through curves)
 CURVE_SLOW_EXPO   = 1.5    # Exponent for speed reduction curve (>1 = stays fast longer on gentle curves)
 
@@ -43,7 +42,7 @@ ENDPOINT_TARGET_SPEED  = 2.0   # Out of 5.0
 # -- Pseudo-distance thresholds (speed_units x seconds, no encoder) --
 REVERSE_PSEUDO_DIST_MAX  = 0.18
 ENDPOINT_PSEUDO_DIST_MAX = 0.4
-LOST_PSEUDO_DIST_MAX     = 0.35
+LOST_PSEUDO_DIST_MAX     = 0.15
 
 # -- Delivery zone parking --
 DELIVERY_ZONE_TIME_THRESHOLD = 0.4
@@ -78,8 +77,6 @@ auto_state     = STATE_FOLLOWING
 internal_speed = 0.0
 last_turn_var  = 0.0
 turn_var       = 0.0
-has_seen_line  = False       # Don't declare LOST until we've seen the line at least once
-lost_start_time = None       # When we first lost all sensors (time-based lost detection)
 
 # -- Pseudo-distance accumulator --
 pseudo_dist      = 0.0
@@ -157,7 +154,7 @@ def _accumulate_pseudo_dist(dt, speed_fraction):
 # ---------------------------------------------------------------------------
 def line_follow_step():
     global auto_state, internal_speed, last_turn_var, current_speed, turn_var
-    global last_step_time, pseudo_dist, has_seen_line, lost_start_time
+    global last_step_time, pseudo_dist
     global all_on_start_time, parking_start_time, auto_mode
     global debug_vx, debug_vy, debug_omega
 
@@ -277,39 +274,23 @@ def line_follow_step():
     # -----------------------------------------------------------------------
     if auto_state == STATE_FOLLOWING:
         if active_count == 0:
-            # Start lost timer if not already running
-            if lost_start_time is None:
-                lost_start_time = now
-
-            lost_elapsed = now - lost_start_time
-
-            # Don't declare LOST until we've actually seen the line at least once
-            # AND we've been without sensors for LOST_DETECTION_DELAY seconds
-            if has_seen_line and lost_elapsed >= LOST_DETECTION_DELAY:
-                speed_frac = internal_speed / 5.0
-                _accumulate_pseudo_dist(dt, speed_frac)
-                if pseudo_dist >= LOST_PSEUDO_DIST_MAX:
-                    _enter_state(STATE_LOST_REVERSE)
-                    internal_speed = 0.0
-                    lost_start_time = None
-                    debug_vx, debug_vy, debug_omega = 0, 0, 0
-                    print(f">>> LOST LINE -> RECOVERY after {lost_elapsed:.2f}s, dist {pseudo_dist:.2f}")
-                    return
-
-            # Actively sweep in last turn direction to re-find the line
-            # instead of just coasting — this prevents falling between sensors
-            direction = 1 if last_turn_var > 0 else -1
-            sweep_omega = direction * SWEEP_TURN_SPEED
-            # Slow gentle forward movement while sweeping
-            sweep_vx = int(min(internal_speed, 1.5) * multiplier * 0.3)
-            internal_speed = max(0.0, internal_speed - DECEL)
-            debug_vx, debug_vy, debug_omega = sweep_vx, 0, int(sweep_omega)
-            moveVector(sweep_vx, 0, int(sweep_omega))
+            speed_frac = internal_speed / 5.0
+            _accumulate_pseudo_dist(dt, speed_frac)
+            if pseudo_dist >= LOST_PSEUDO_DIST_MAX:
+                _enter_state(STATE_LOST_REVERSE)
+                internal_speed = 0.0
+                debug_vx, debug_vy, debug_omega = 0, 0, 0
+                print(f">>> LOST LINE -> RECOVERY after dist {pseudo_dist:.2f}")
+            else:
+                # Coast with last known rotation
+                internal_speed = max(0.0, internal_speed - DECEL)
+                coast_vx = int(internal_speed * multiplier)
+                coast_omega = (1 if last_turn_var > 0 else -1) * int(internal_speed * multiplier * 0.5)
+                debug_vx, debug_vy, debug_omega = coast_vx, 0, coast_omega
+                moveVector(coast_vx, 0, coast_omega)
             return
         else:
             pseudo_dist = 0.0
-            lost_start_time = None    # Reset lost timer when we see the line
-            has_seen_line = True       # Mark that we've seen the line at least once
 
         if active_count == 5:
             _enter_state(STATE_ENDPOINT)
@@ -694,8 +675,6 @@ if __name__ == "__main__":
                         _enter_state(STATE_FOLLOWING)
                         internal_speed  = 0.0
                         last_step_time  = 0.0
-                        has_seen_line   = False
-                        lost_start_time = None
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
                 elif event.key == pygame.K_s:      pressed['s'] = True;  update_movement()
                 elif event.key == pygame.K_a:      pressed['a'] = True;  update_movement()
